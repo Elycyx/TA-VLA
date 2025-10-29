@@ -9,6 +9,7 @@ import numpy as np
 import tqdm
 import tyro
 
+import openpi.models.model as _model
 import openpi.shared.normalize as normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
@@ -20,11 +21,18 @@ class RemoveStrings(transforms.DataTransformFn):
         return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
 
 
-def create_dataset(config: _config.TrainConfig) -> tuple[_config.DataConfig, _data_loader.Dataset]:
-    data_config = config.data.create(config.assets_dirs, config.model)
+def create_dataloader(
+    data_config: _config.DataConfig,
+    model_config: _model.BaseModelConfig,
+    batch_size: int,
+    num_workers: int,
+    max_frames: int | None = None,
+) -> tuple[_data_loader.TorchDataLoader, int]:
+    """Create a data loader for computing normalization statistics."""
     if data_config.repo_id is None:
         raise ValueError("Data config must have a repo_id")
-    dataset = _data_loader.create_dataset(data_config, config.model)
+    
+    dataset = _data_loader.create_dataset(data_config, model_config)
     dataset = _data_loader.TransformedDataset(
         dataset,
         [
@@ -34,7 +42,22 @@ def create_dataset(config: _config.TrainConfig) -> tuple[_config.DataConfig, _da
             RemoveStrings(),
         ],
     )
-    return data_config, dataset
+    
+    if max_frames is not None and max_frames < len(dataset):
+        num_batches = max_frames // batch_size
+        shuffle = True
+    else:
+        num_batches = len(dataset) // batch_size
+        shuffle = False
+    
+    data_loader = _data_loader.TorchDataLoader(
+        dataset,
+        local_batch_size=batch_size,
+        num_workers=num_workers,
+        shuffle=shuffle,
+        num_batches=num_batches,
+    )
+    return data_loader, num_batches
 
 
 def main(config_name: str, max_frames: int | None = None):
@@ -52,30 +75,8 @@ def main(config_name: str, max_frames: int | None = None):
         print(f"compute norm stats for repo: {data_id}")
         object.__setattr__(data_config, "repo_id", data_id)
 
-        dataset = _data_loader.create_dataset(data_config, config.model)
-        dataset = _data_loader.TransformedDataset(
-            dataset,
-            [
-                *data_config.repack_transforms.inputs,
-                *data_config.data_transforms.inputs,
-                # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
-                RemoveStrings(),
-            ],
-        )
-        
-        num_frames = len(dataset)
-        shuffle = False
-
-        if max_frames is not None and max_frames < num_frames:
-            num_frames = max_frames
-            shuffle = True
-
-        data_loader = _data_loader.TorchDataLoader(
-            dataset,
-            local_batch_size=8,
-            num_workers=8,
-            shuffle=shuffle,
-            num_batches=num_frames,
+        data_loader, num_batches = create_dataloader(
+            data_config, config.model, config.batch_size, config.num_workers, max_frames
         )
 
         keys = ["state", "actions"]
@@ -83,10 +84,15 @@ def main(config_name: str, max_frames: int | None = None):
             keys.append("effort")
         stats = {key: normalize.RunningStats() for key in keys}
 
-        for batch in tqdm.tqdm(data_loader, total=num_frames, desc="Computing stats"):
+        for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
             for key in keys:
-                values = np.asarray(batch[key][0])
-                stats[key].update(values.reshape(-1, values.shape[-1]))
+                values = np.asarray(batch[key])
+                # Reshape to 2D: (num_samples, feature_dim)
+                if values.ndim > 2:
+                    values = values.reshape(-1, values.shape[-1])
+                elif values.ndim == 1:
+                    values = values.reshape(-1, 1)
+                stats[key].update(values)
 
         norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 

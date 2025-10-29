@@ -21,6 +21,7 @@ import openpi.models.model as _model
 import openpi.models.pi0 as pi0
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
+import openpi.policies.favla_policy as favla_policy
 import openpi.policies.tavla_policy as tavla_policy
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
@@ -507,6 +508,171 @@ class LeRobotTavlaDataConfig(DataConfigFactory):
             logging.warning(f"Norm stats not found in {data_assets_dir}, skipping.")
             return None
 
+@dataclasses.dataclass(frozen=True)
+class LeRobotFavlaDataConfig(DataConfigFactory):
+    # If true, will convert joint dimensions to deltas with respect to the current state before passing to the model.
+    # Gripper dimensions will remain in absolute values.
+    use_delta_joint_actions: bool = False
+    # If provided, will be injected into the input data if the "prompt" key is not present.
+    default_prompt: str | None = None
+    # If true, will pad the dim of norm_stats to 32, so pi0 could compatible with pi0_fast's norm_stats.
+    padding_stat: bool = False
+
+    # Sequence of relative timestamps (in frames) for effort history. For example, (-20, -10, 0) means
+    # loading effort data from 20 frames ago, 10 frames ago, and the current frame.
+    # If empty, will not load effort data.
+    effort_history: Sequence[int] = ()
+
+    # Repack transforms.
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(default=_transforms.Group())
+    # Action keys that will be used to read the action sequence from the dataset.
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    def __post_init__(self):
+        images = {
+            "images": "observation.images",
+        }
+        repack_dict = {
+            "images": images,
+            "state": "observation.state",
+            "actions": "action",
+        }
+        if self.default_prompt is None:
+            repack_dict["prompt"] = "prompt"
+        if self.effort_history:
+            repack_dict["effort"] = "observation.effort"
+        object.__setattr__(
+            self,
+            "repack_transforms",
+            _transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        repack_dict
+                    )
+                ]
+            ),
+        )
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[
+                favla_policy.FavlaInputs(
+                    action_dim=model_config.action_dim,
+                )
+            ],
+            outputs=[favla_policy.FavlaOutputs()],
+        )
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        if self.default_prompt and isinstance(self.repo_id, list):
+            raise ValueError("Using default prompt when using multiple dataset is incorrect.")
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+            effort_history=self.effort_history,
+            prompt_from_task=(self.default_prompt is None),
+        )
+
+    # 处理多数据集时的情况，此时asset_id=repo_id是一个list，norm_stats直接存在assets_base_dir/config_name下
+    def _load_norm_stats(
+        self, assets_dir: epath.Path, asset_id: str | list[str] | None
+    ) -> dict[str, _transforms.NormStats] | None:
+        if asset_id is None:
+            return None
+
+        try:
+            if isinstance(asset_id, list):
+                key_stats_map = {"state": [], "actions": []}  # key -> [(task, norm_stats, frame_count)]
+
+                for asset in asset_id:
+                    data_assets_dir = str(assets_dir / asset)
+                    stats = _normalize.load(_download.maybe_download(data_assets_dir))
+
+                    dataset_path = LEROBOT_HOME / asset
+                    info = load_info(dataset_path)
+                    frame_count = info["total_frames"]
+
+                    task = load_tasks(dataset_path)
+                    assert len(task) == 1, f"dataset {asset} has {len(task)} tasks"
+
+                    logging.info(f"Loaded norm stats from {data_assets_dir} with {frame_count} frames")
+
+                    for key in stats:
+                        key_stats_map[key].append((task[0], stats[key], frame_count))
+
+                all_stats = {}
+                for data_key, relevant_stats in key_stats_map.items():
+                    logging.info(f"combine {data_key} from {len(relevant_stats)} datasets:")
+
+                    for task, stat, count in relevant_stats:
+                        logging.info(f"dataset {task} (frame count: {count}):")
+                        logging.info(
+                            f"  mean: {np.array2string(stat[data_key].mean, precision=2, suppress_small=True)}"
+                        )
+                        logging.info(f"  std: {np.array2string(stat[data_key].std, precision=2, suppress_small=True)}")
+                        logging.info(f"  q01: {np.array2string(stat[data_key].q01, precision=2, suppress_small=True)}")
+                        logging.info(f"  q99: {np.array2string(stat[data_key].q99, precision=2, suppress_small=True)}")
+
+                    total_frames = sum(count for _, count in relevant_stats)
+
+                    mean = np.sum(
+                        np.array([stats[data_key].mean * (count / total_frames) for stats, count in relevant_stats]),
+                        axis=0,
+                    )
+                    std = np.sqrt(
+                        np.sum(
+                            [
+                                (stats[data_key].std ** 2 + (stats[data_key].mean - mean) ** 2) * (count / total_frames)
+                                for stats, count in relevant_stats
+                            ]
+                        )
+                    )
+
+                    q01 = np.minimum.reduce([stats[data_key].q01 for stats, _ in relevant_stats])
+                    q99 = np.maximum.reduce([stats[data_key].q99 for stats, _ in relevant_stats])
+
+                    logging.info("after combine:")
+                    logging.info(f"  mean: {np.array2string(mean, precision=2, suppress_small=True)}")
+                    logging.info(f"  std: {np.array2string(std, precision=2, suppress_small=True)}")
+                    logging.info(f"  q01: {np.array2string(q01, precision=2, suppress_small=True)}")
+                    logging.info(f"  q99: {np.array2string(q99, precision=2, suppress_small=True)}")
+
+                    all_stats[data_key] = _transforms.NormStats(
+                        mean=mean,
+                        std=std,
+                        q01=q01,
+                        q99=q99,
+                    )
+            else:
+                data_assets_dir = str(assets_dir / asset_id)
+                all_stats = _normalize.load(_download.maybe_download(data_assets_dir))
+                logging.info(f"Loaded norm stats from {data_assets_dir}")
+
+            if self.padding_stat:
+                for data_key in all_stats:
+                    all_stats[data_key] = _transforms.NormStats(
+                        mean=_transforms.pad_to_dim(all_stats[data_key].mean, 32),
+                        std=_transforms.pad_to_dim(all_stats[data_key].std, 32),
+                        q01=_transforms.pad_to_dim(all_stats[data_key].q01, 32),
+                        q99=_transforms.pad_to_dim(all_stats[data_key].q99, 32),
+                    )
+
+            return all_stats
+        except FileNotFoundError:
+            logging.warning(f"Norm stats not found in {data_assets_dir}, skipping.")
+            return None
 
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
@@ -548,7 +714,7 @@ class TrainConfig:
     # will increase memory and CPU usage.
     num_workers: int = 2
     # Number of train steps (batches) to run.
-    num_train_steps: int = 20_000
+    num_train_steps: int = 30_000
 
     # How often (in steps) to log training metrics.
     log_interval: int = 100
@@ -563,7 +729,7 @@ class TrainConfig:
     resume: bool = False
 
     # If true, will enable wandb logging.
-    wandb_enabled: bool = False
+    wandb_enabled: bool = True
 
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
@@ -866,6 +1032,25 @@ _CONFIGS = [
         num_train_steps=30_000,
         freeze_filter=pi0.Pi0Config(
             paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_lora_favla",
+        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora", effort_type=EffortType.EXPERT_HIS_C, effort_dim=6),
+        data=LeRobotFavlaDataConfig(
+            repo_id="cyx/forceumi1",
+            effort_history=tuple((3*i-60 for i in range(20))), # sample 20 frames in 2s
+            default_prompt="clean the toilet",
+
+            base_config=DataConfig(
+                local_files_only=True, # Set to True for local-only datasets.
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora", effort_dim=6, effort_type=EffortType.EXPERT_HIS_C
         ).get_freeze_filter(),
         ema_decay=None,
     ),
