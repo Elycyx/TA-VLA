@@ -241,26 +241,58 @@ def main(arguments: Arguments) -> None:
                 print(f"    - Effort: {observation['effort'].shape}")
             print(f"    - 提示: {observation['prompt']}")
             
+            # 提取数据集中的原始 action
+            ground_truth_action = None
+            if "action" in item:
+                ground_truth_action = convert_to_numpy(item["action"])
+                print(f"\n  数据集原始动作:")
+                print(f"    形状: {ground_truth_action.shape}")
+                # 显示前7维（通常是机器人关节）
+                if ground_truth_action.ndim == 1 and len(ground_truth_action) >= 7:
+                    print(f"    前7维: {ground_truth_action[:7]}")
+                elif ground_truth_action.ndim == 1:
+                    print(f"    数据: {ground_truth_action}")
+            
             # 执行推理
             action = policy.infer(observation)
             
             # 显示结果
-            print(f"  ✓ 推理成功")
+            print(f"\n  ✓ 推理成功")
             actions_array = action['actions']
-            print(f"    动作形状: {actions_array.shape}")
+            print(f"  Policy 输出动作:")
+            print(f"    形状: {actions_array.shape}")
             
             # 根据形状灵活显示动作
             # 可能的形状: (action_horizon, action_dim) 或 (batch, action_horizon, action_dim)
+            predicted_first_action = None
             if actions_array.ndim == 3:
                 # 形状 [batch, action_horizon, action_dim]
-                first_action = actions_array[0, 0, :7]
-                print(f"    第一个时间步（前7维）: {first_action}")
+                predicted_first_action = actions_array[0, 0]
+                print(f"    第一个时间步（前7维）: {predicted_first_action[:7]}")
             elif actions_array.ndim == 2:
                 # 形状 [action_horizon, action_dim]
-                first_action = actions_array[0, :7] if actions_array.shape[1] >= 7 else actions_array[0]
-                print(f"    第一个时间步（前7维）: {first_action}")
+                predicted_first_action = actions_array[0]
+                display_action = actions_array[0, :7] if actions_array.shape[1] >= 7 else actions_array[0]
+                print(f"    第一个时间步（前7维）: {display_action}")
             else:
-                print(f"    动作数据: {actions_array}")
+                print(f"    数据: {actions_array}")
+            
+            # 如果有原始动作，计算误差
+            if ground_truth_action is not None and predicted_first_action is not None:
+                print(f"\n  对比分析:")
+                # 计算均方误差 (MSE)
+                mse = np.mean((predicted_first_action[:len(ground_truth_action)] - ground_truth_action) ** 2)
+                print(f"    MSE (均方误差): {mse:.6f}")
+                
+                # 计算 L2 距离
+                l2_distance = np.linalg.norm(predicted_first_action[:len(ground_truth_action)] - ground_truth_action)
+                print(f"    L2 距离: {l2_distance:.6f}")
+                
+                # 计算每个维度的绝对误差
+                abs_errors = np.abs(predicted_first_action[:len(ground_truth_action)] - ground_truth_action)
+                print(f"    各维度绝对误差: {abs_errors[:7] if len(abs_errors) >= 7 else abs_errors}")
+                print(f"    平均绝对误差: {np.mean(abs_errors):.6f}")
+                print(f"    最大绝对误差: {np.max(abs_errors):.6f}")
             
             successful_inferences += 1
             

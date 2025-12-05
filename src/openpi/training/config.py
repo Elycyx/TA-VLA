@@ -512,7 +512,7 @@ class LeRobotTavlaDataConfig(DataConfigFactory):
 class LeRobotFavlaDataConfig(DataConfigFactory):
     # If true, will convert joint dimensions to deltas with respect to the current state before passing to the model.
     # Gripper dimensions will remain in absolute values.
-    use_delta_joint_actions: bool = False
+    use_delta_joint_actions: bool = True
     # If provided, will be injected into the input data if the "prompt" key is not present.
     default_prompt: str | None = None
     # If true, will pad the dim of norm_stats to 32, so pi0 could compatible with pi0_fast's norm_stats.
@@ -1039,9 +1039,9 @@ _CONFIGS = [
         name="pi0_lora_favla",
         model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora", effort_type=EffortType.EXPERT_HIS_C, effort_dim=6),
         data=LeRobotFavlaDataConfig(
-            repo_id="cyx/forceumi1",
+            repo_id="cyx/forceumi2",
             effort_history=tuple((3*i-60 for i in range(20))), # sample 20 frames in 2s
-            default_prompt="clean the toilet",
+            default_prompt="clean the basin",
 
             base_config=DataConfig(
                 local_files_only=True, # Set to True for local-only datasets.
