@@ -555,20 +555,29 @@ class LeRobotFavlaDataConfig(DataConfigFactory):
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        data_transforms = _transforms.Group(
-            inputs=[
-                favla_policy.FavlaInputs(
-                    action_dim=model_config.action_dim,
-                )
-            ],
-            outputs=[favla_policy.FavlaOutputs()],
-        )
+        # Build inputs list: DeltaActions must come BEFORE FavlaInputs
+        # because FavlaInputs sets state to 0, which would break delta computation
+        inputs_list = []
         if self.use_delta_joint_actions:
-            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
-            data_transforms = data_transforms.push(
-                inputs=[_transforms.DeltaActions(delta_action_mask)],
-                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            # Favla is single-arm: 6 joints + 1 gripper = 7 dimensions
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            inputs_list.append(_transforms.DeltaActions(delta_action_mask))
+        inputs_list.append(
+            favla_policy.FavlaInputs(
+                action_dim=model_config.action_dim,
             )
+        )
+        
+        # Build outputs list
+        outputs_list = [favla_policy.FavlaOutputs()]
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            outputs_list.insert(0, _transforms.AbsoluteActions(delta_action_mask))
+        
+        data_transforms = _transforms.Group(
+            inputs=inputs_list,
+            outputs=outputs_list,
+        )
 
         if self.default_prompt and isinstance(self.repo_id, list):
             raise ValueError("Using default prompt when using multiple dataset is incorrect.")
@@ -1039,7 +1048,7 @@ _CONFIGS = [
         name="pi0_lora_favla",
         model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora", effort_type=EffortType.EXPERT_HIS_C, effort_dim=6),
         data=LeRobotFavlaDataConfig(
-            repo_id="cyx/forceumi2",
+            repo_id="cyx/basin_noup",
             effort_history=tuple((3*i-60 for i in range(20))), # sample 20 frames in 2s
             default_prompt="clean the basin",
 
@@ -1048,7 +1057,8 @@ _CONFIGS = [
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=30_000,
+        num_train_steps=50_000,
+        batch_size=32,
         freeze_filter=pi0.Pi0Config(
             paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora", effort_dim=6, effort_type=EffortType.EXPERT_HIS_C
         ).get_freeze_filter(),
