@@ -1046,9 +1046,9 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi0_lora_favla",
-        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora", effort_type=EffortType.EXPERT_HIS_C, effort_dim=6),
+        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora", effort_type=EffortType.EXPERT_HIS_C_FUT, effort_dim=6),
         data=LeRobotFavlaDataConfig(
-            repo_id="cyx/basin_noup",
+            repo_id="cyx/basin_1223_noup",
             effort_history=tuple((3*i-60 for i in range(20))), # sample 20 frames in 2s
             default_prompt="clean the basin",
 
@@ -1057,10 +1057,10 @@ _CONFIGS = [
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=50_000,
+        num_train_steps=40_000,
         batch_size=32,
         freeze_filter=pi0.Pi0Config(
-            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora", effort_dim=6, effort_type=EffortType.EXPERT_HIS_C
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora", effort_dim=6, effort_type=EffortType.EXPERT_HIS_C_FUT
         ).get_freeze_filter(),
         ema_decay=None,
     ),
